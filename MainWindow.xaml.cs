@@ -27,6 +27,36 @@ namespace NetworkSonification
         Demo
     }
 
+    public class ActiveTone
+    {
+        public double Frequency { get; set; }
+        public float Amplitude { get; set; }
+        public SignalGeneratorType WaveType { get; set; }
+        public double Life { get; set; }
+        public double Phase { get; set; }
+        public string Protocol { get; set; }
+    }
+
+    public class PacketData
+    {
+        public int Size { get; set; }
+        public DateTime Timestamp { get; set; }
+        public string Protocol { get; set; }
+        public string SourceIP { get; set; }
+        public string DestinationIP { get; set; }
+        public int Port { get; set; }
+    }
+
+    public class PacketVisual
+    {
+        public double X { get; set; }
+        public double Y { get; set; }
+        public double Size { get; set; }
+        public Color Color { get; set; }
+        public double Life { get; set; }
+        public string Protocol { get; set; }
+    }
+
     public partial class MainWindow : Window
     {
         private LibPcapLiveDevice selectedDevice;
@@ -37,12 +67,14 @@ namespace NetworkSonification
         private Thread captureThread;
 
         private WaveOutEvent waveOut;
-        private MixingSampleProvider mixer;
+        private BufferedWaveProvider bufferedProvider;
         private ConcurrentQueue<PacketData> packetQueue;
         private DispatcherTimer visualTimer;
         private DispatcherTimer demoTimer;
+        private DispatcherTimer audioTimer;
         private List<double> audioSamples;
         private List<PacketVisual> packetVisuals;
+        private List<ActiveTone> activeTones;
         private Random random;
 
         // Audio parameters
@@ -62,14 +94,27 @@ namespace NetworkSonification
         {
             packetQueue = new ConcurrentQueue<PacketData>();
             audioSamples = new List<double>();
+            activeTones = new List<ActiveTone>();
             random = new Random();
 
-            // Setup audio output
-            mixer = new MixingSampleProvider(WaveFormat.CreateIeeeFloatWaveFormat(SAMPLE_RATE, 1));
-            mixer.ReadFully = false;
+            // Setup continuous audio buffer
+            var waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(SAMPLE_RATE, 1);
+            bufferedProvider = new BufferedWaveProvider(waveFormat);
+            bufferedProvider.BufferLength = SAMPLE_RATE * 2; // 2 seconds buffer
+            bufferedProvider.DiscardOnBufferOverflow = true;
 
             waveOut = new WaveOutEvent();
-            waveOut.Init(mixer);
+            waveOut.Init(bufferedProvider);
+
+            // Timer for continuous audio generation
+            audioTimer = new DispatcherTimer();
+            audioTimer.Interval = TimeSpan.FromMilliseconds(20); // 50Hz audio updates
+            audioTimer.Tick += AudioTimer_Tick;
+        }
+
+        private void AudioTimer_Tick(object sender, EventArgs e)
+        {
+            GenerateContinuousAudio();
         }
 
         private void InitializeVisualization()
@@ -205,24 +250,26 @@ namespace NetworkSonification
             {
                 isCapturing = true;
 
-                switch (currentMode)
+                if (currentMode == CaptureMode.WinPcap)
                 {
-                    case CaptureMode.WinPcap:
-                        StartWinPcapCapture();
-                        break;
-                    case CaptureMode.RawSocket:
-                        StartRawSocketCapture();
-                        break;
-                    case CaptureMode.Demo:
-                        StartDemoCapture();
-                        break;
+                    StartWinPcapCapture();
                 }
+                else if (currentMode == CaptureMode.RawSocket)
+                {
+                    StartRawSocketCapture();
+                }
+                else if (currentMode == CaptureMode.Demo)
+                {
+                    StartDemoCapture();
+                }
+
+                visualTimer.Start();
+                audioTimer.Start();
 
                 if (!isMuted)
                 {
                     waveOut.Play();
                 }
-                visualTimer.Start();
             }
             catch (Exception ex)
             {
@@ -235,8 +282,9 @@ namespace NetworkSonification
         private void StartWinPcapCapture()
         {
             var selectedItem = InterfaceComboBox.SelectedItem as ComboBoxItem;
-            if (selectedItem?.Tag is LibPcapLiveDevice device)
+            if (selectedItem != null && selectedItem.Tag is LibPcapLiveDevice)
             {
+                var device = selectedItem.Tag as LibPcapLiveDevice;
                 selectedDevice = device;
                 selectedDevice.OnPacketArrival += OnWinPcapPacketArrival;
                 selectedDevice.Open(DeviceModes.Promiscuous, 1000);
@@ -275,7 +323,8 @@ namespace NetworkSonification
                     System.Diagnostics.Debug.WriteLine(string.Format("Could not enable promiscuous mode: {0}", ex.Message));
                 }
 
-                captureThread = new Thread(RawSocketCaptureLoop) { IsBackground = true };
+                captureThread = new Thread(RawSocketCaptureLoop);
+                captureThread.IsBackground = true;
                 captureThread.Start();
 
                 StatusLabel.Content = string.Format("Capturing via Raw Socket: {0}", localIP);
@@ -379,8 +428,8 @@ namespace NetworkSonification
         private void GenerateDemoPacket(object sender, EventArgs e)
         {
             // Generate realistic demo packets
-            var protocols = new[] { "TCP", "UDP", "HTTP", "HTTPS", "DNS" };
-            var sizes = new[] { 64, 128, 256, 512, 1024, 1500 };
+            var protocols = new string[] { "TCP", "UDP", "HTTP", "HTTPS", "DNS" };
+            var sizes = new int[] { 64, 128, 256, 512, 1024, 1500 };
 
             var packetData = new PacketData
             {
@@ -439,6 +488,10 @@ namespace NetworkSonification
 
             waveOut.Stop();
             visualTimer.Stop();
+            audioTimer.Stop();
+
+            // Clear active tones
+            activeTones.Clear();
 
             StatusLabel.Content = string.Format("Stopped - {0} mode available", currentMode);
         }
@@ -501,13 +554,15 @@ namespace NetworkSonification
             };
 
             // Analyze packet layers
-            if (packet.PayloadPacket is IPPacket ipPacket)
+            if (packet.PayloadPacket is IPPacket)
             {
+                var ipPacket = packet.PayloadPacket as IPPacket;
                 data.SourceIP = ipPacket.SourceAddress.ToString();
                 data.DestinationIP = ipPacket.DestinationAddress.ToString();
 
-                if (ipPacket.PayloadPacket is TcpPacket tcpPacket)
+                if (ipPacket.PayloadPacket is TcpPacket)
                 {
+                    var tcpPacket = ipPacket.PayloadPacket as TcpPacket;
                     data.Protocol = "TCP";
                     data.Port = tcpPacket.DestinationPort;
 
@@ -517,8 +572,9 @@ namespace NetworkSonification
                     else if (tcpPacket.DestinationPort == 443)
                         data.Protocol = "HTTPS";
                 }
-                else if (ipPacket.PayloadPacket is UdpPacket udpPacket)
+                else if (ipPacket.PayloadPacket is UdpPacket)
                 {
+                    var udpPacket = ipPacket.PayloadPacket as UdpPacket;
                     data.Protocol = "UDP";
                     data.Port = udpPacket.DestinationPort;
 
@@ -560,38 +616,36 @@ namespace NetworkSonification
                 byte protocol = buffer[9];
                 int headerLength = (buffer[0] & 0x0F) * 4;
 
-                switch (protocol)
+                if (protocol == 6) // TCP
                 {
-                    case 6: // TCP
-                        data.Protocol = "TCP";
-                        if (length >= headerLength + 4)
-                        {
-                            data.Port = (buffer[headerLength + 2] << 8) | buffer[headerLength + 3];
+                    data.Protocol = "TCP";
+                    if (length >= headerLength + 4)
+                    {
+                        data.Port = (buffer[headerLength + 2] << 8) | buffer[headerLength + 3];
 
-                            // Detect common protocols by port
-                            if (data.Port == 80) data.Protocol = "HTTP";
-                            else if (data.Port == 443) data.Protocol = "HTTPS";
-                        }
-                        break;
+                        // Detect common protocols by port
+                        if (data.Port == 80) data.Protocol = "HTTP";
+                        else if (data.Port == 443) data.Protocol = "HTTPS";
+                    }
+                }
+                else if (protocol == 17) // UDP
+                {
+                    data.Protocol = "UDP";
+                    if (length >= headerLength + 4)
+                    {
+                        data.Port = (buffer[headerLength + 2] << 8) | buffer[headerLength + 3];
 
-                    case 17: // UDP
-                        data.Protocol = "UDP";
-                        if (length >= headerLength + 4)
-                        {
-                            data.Port = (buffer[headerLength + 2] << 8) | buffer[headerLength + 3];
-
-                            // Detect DNS
-                            if (data.Port == 53) data.Protocol = "DNS";
-                        }
-                        break;
-
-                    case 1: // ICMP
-                        data.Protocol = "ICMP";
-                        break;
-
-                    default:
-                        data.Protocol = "IP";
-                        break;
+                        // Detect DNS
+                        if (data.Port == 53) data.Protocol = "DNS";
+                    }
+                }
+                else if (protocol == 1) // ICMP
+                {
+                    data.Protocol = "ICMP";
+                }
+                else
+                {
+                    data.Protocol = "IP";
                 }
 
                 return data;
@@ -610,31 +664,99 @@ namespace NetworkSonification
 
         private void GenerateAudioFromPacket(PacketData packet)
         {
-            // Map packet properties to audio parameters
-            float frequency = MapToFrequency(packet);
-            float amplitude = MapToAmplitude(packet);
-            float duration = MapToDuration(packet);
-
-            // Create audio signal
-            var signal = new SignalGenerator(SAMPLE_RATE, 1)
+            // Add packet as an active tone instead of immediate playback
+            var tone = new ActiveTone
             {
-                Frequency = frequency,
-                Gain = amplitude,
-                Type = GetWaveformType(packet.Protocol)
-            }.Take(TimeSpan.FromMilliseconds(duration));
+                Frequency = MapToFrequency(packet),
+                Amplitude = MapToAmplitude(packet),
+                WaveType = GetWaveformType(packet.Protocol),
+                Life = MapToDuration(packet) / 1000.0, // Convert to seconds
+                Phase = 0,
+                Protocol = packet.Protocol
+            };
 
-            // Add to mixer
-            Dispatcher.BeginInvoke(new Action(() =>
+            activeTones.Add(tone);
+        }
+
+        private void GenerateContinuousAudio()
+        {
+            if (!isCapturing || isMuted) return;
+
+            // Generate audio samples
+            int samplesToGenerate = SAMPLE_RATE * 20 / 1000; // 20ms worth of samples
+            float[] audioBuffer = new float[samplesToGenerate];
+
+            for (int i = 0; i < samplesToGenerate; i++)
             {
-                try
+                float sample = 0;
+
+                // Mix all active tones
+                for (int t = activeTones.Count - 1; t >= 0; t--)
                 {
-                    mixer.AddMixerInput(signal.ToMono());
+                    var tone = activeTones[t];
+
+                    // Generate waveform sample
+                    float waveValue = GenerateWaveform(tone.WaveType, tone.Phase);
+                    sample += waveValue * tone.Amplitude;
+
+                    // Update phase
+                    tone.Phase += 2.0 * Math.PI * tone.Frequency / SAMPLE_RATE;
+                    if (tone.Phase > 2.0 * Math.PI) tone.Phase -= 2.0 * Math.PI;
+
+                    // Decay the tone
+                    tone.Life -= 1.0 / SAMPLE_RATE;
+                    tone.Amplitude *= 0.999f; // Gradual fade
+
+                    // Remove expired tones
+                    if (tone.Life <= 0 || tone.Amplitude < 0.001f)
+                    {
+                        activeTones.RemoveAt(t);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine(string.Format("Audio generation error: {0}", ex.Message));
-                }
-            }));
+
+                // Limit amplitude to prevent clipping
+                sample = Math.Max(-0.8f, Math.Min(0.8f, sample));
+                audioBuffer[i] = sample;
+            }
+
+            // Convert to bytes and add to buffer (.NET 4.8 compatible)
+            byte[] byteBuffer = new byte[audioBuffer.Length * 4];
+            for (int i = 0; i < audioBuffer.Length; i++)
+            {
+                byte[] floatBytes = BitConverter.GetBytes(audioBuffer[i]);
+                Array.Copy(floatBytes, 0, byteBuffer, i * 4, 4);
+            }
+
+            // Add to audio buffer if there's space
+            if (bufferedProvider.BufferedBytes < bufferedProvider.BufferLength - byteBuffer.Length)
+            {
+                bufferedProvider.AddSamples(byteBuffer, 0, byteBuffer.Length);
+            }
+        }
+
+        private float GenerateWaveform(SignalGeneratorType waveType, double phase)
+        {
+            if (waveType == SignalGeneratorType.Sin)
+            {
+                return (float)Math.Sin(phase);
+            }
+            else if (waveType == SignalGeneratorType.Square)
+            {
+                return Math.Sin(phase) >= 0 ? 1.0f : -1.0f;
+            }
+            else if (waveType == SignalGeneratorType.Triangle)
+            {
+                double normalizedPhase = phase / (2.0 * Math.PI);
+                normalizedPhase = normalizedPhase - Math.Floor(normalizedPhase);
+                if (normalizedPhase < 0.5)
+                    return (float)(4.0 * normalizedPhase - 1.0);
+                else
+                    return (float)(3.0 - 4.0 * normalizedPhase);
+            }
+            else
+            {
+                return (float)Math.Sin(phase);
+            }
         }
 
         private float MapToFrequency(PacketData packet)
@@ -654,30 +776,24 @@ namespace NetworkSonification
         private float MapToDuration(PacketData packet)
         {
             // Duration based on protocol (50ms - 300ms)
-            switch (packet.Protocol)
-            {
-                case "TCP": return 200;
-                case "HTTP": return 250;
-                case "HTTPS": return 250;
-                case "UDP": return 100;
-                case "DNS": return 150;
-                case "ICMP": return 150;
-                default: return 100;
-            }
+            if (packet.Protocol == "TCP") return 200;
+            else if (packet.Protocol == "HTTP") return 250;
+            else if (packet.Protocol == "HTTPS") return 250;
+            else if (packet.Protocol == "UDP") return 100;
+            else if (packet.Protocol == "DNS") return 150;
+            else if (packet.Protocol == "ICMP") return 150;
+            else return 100;
         }
 
         private SignalGeneratorType GetWaveformType(string protocol)
         {
-            switch (protocol)
-            {
-                case "TCP": return SignalGeneratorType.Sin;
-                case "HTTP": return SignalGeneratorType.Sin;
-                case "HTTPS": return SignalGeneratorType.Sin;
-                case "UDP": return SignalGeneratorType.Square;
-                case "DNS": return SignalGeneratorType.Triangle;
-                case "ICMP": return SignalGeneratorType.Triangle;
-                default: return SignalGeneratorType.Sin;
-            }
+            if (protocol == "TCP") return SignalGeneratorType.Sin;
+            else if (protocol == "HTTP") return SignalGeneratorType.Sin;
+            else if (protocol == "HTTPS") return SignalGeneratorType.Sin;
+            else if (protocol == "UDP") return SignalGeneratorType.Square;
+            else if (protocol == "DNS") return SignalGeneratorType.Triangle;
+            else if (protocol == "ICMP") return SignalGeneratorType.Triangle;
+            else return SignalGeneratorType.Sin;
         }
 
         private void UpdateVisualization(object sender, EventArgs e)
@@ -690,12 +806,13 @@ namespace NetworkSonification
         private void UpdatePacketVisuals()
         {
             // Process queued packets for visualization
-            while (packetQueue.TryDequeue(out PacketData packet))
+            PacketData packet;
+            while (packetQueue.TryDequeue(out packet))
             {
                 // Use full canvas width by starting packets at left edge
                 packetVisuals.Add(new PacketVisual
                 {
-                    X = -20, // Start slightly off-screen to the left
+                    X = 0, 
                     Y = random.Next(50, Math.Max(51, (int)PacketCanvas.ActualHeight - 50)),
                     Size = Math.Max(4, Math.Min(packet.Size / 50.0, 25)), // Better size range
                     Color = GetProtocolColor(packet.Protocol),
@@ -717,7 +834,7 @@ namespace NetworkSonification
                 // Move packets across full screen width
                 double speed = 3 + (visual.Size / 10.0); // Larger packets move slightly faster
                 visual.X += speed;
-                visual.Life -= 0.015; // Slower fade for better visibility
+                visual.Life -= 0.0015; // Slower fade for better visibility
 
                 // Remove packets that are off-screen or fully faded
                 if (visual.Life <= 0 || visual.X > canvasWidth + 50)
@@ -733,15 +850,24 @@ namespace NetworkSonification
                     Height = visual.Size,
                     Fill = new SolidColorBrush(Color.FromArgb(
                         (byte)(255 * visual.Life),
-                        visual.Color.R, visual.Color.G, visual.Color.B)),
-                    Effect = new System.Windows.Media.Effects.DropShadowEffect
+                        visual.Color.R, visual.Color.G, visual.Color.B))
+                };
+
+                // Add glow effect
+                try
+                {
+                    ellipse.Effect = new System.Windows.Media.Effects.DropShadowEffect
                     {
                         Color = visual.Color,
                         BlurRadius = visual.Size / 3,
                         ShadowDepth = 0,
                         Opacity = visual.Life * 0.5
-                    }
-                };
+                    };
+                }
+                catch
+                {
+                    // Skip glow effect if it causes issues
+                }
 
                 Canvas.SetLeft(ellipse, visual.X);
                 Canvas.SetTop(ellipse, visual.Y);
@@ -769,7 +895,7 @@ namespace NetworkSonification
                 for (int i = 0; i < Math.Min(audioSamples.Count, width); i++)
                 {
                     double x = (i / (double)audioSamples.Count) * width;
-                    double y = centerY + (audioSamples[i] * centerY * 0.8);
+                    double y = centerY + (audioSamples[i] * centerY * 0.5);
                     polyline.Points.Add(new Point(x, y));
                 }
 
@@ -791,7 +917,8 @@ namespace NetworkSonification
                 double sample = 0;
 
                 // Add contribution from recent packets
-                foreach (var visual in packetVisuals.Take(10))
+                var recentVisuals = packetVisuals.Take(10);
+                foreach (var visual in recentVisuals)
                 {
                     double freq = MapToFrequency(new PacketData { Size = (int)visual.Size * 50 });
                     sample += Math.Sin(2 * Math.PI * freq * time * i / 200.0) * visual.Life * 0.3;
@@ -816,44 +943,24 @@ namespace NetworkSonification
 
         private Color GetProtocolColor(string protocol)
         {
-            switch (protocol)
-            {
-                case "TCP": return Colors.Blue;
-                case "UDP": return Colors.Red;
-                case "HTTP": return Colors.Green;
-                case "HTTPS": return Colors.Purple;
-                case "DNS": return Colors.Orange;
-                case "ICMP": return Colors.Yellow;
-                case "IP": return Colors.Cyan;
-                default: return Colors.White;
-            }
+            if (protocol == "TCP") return Colors.Blue;
+            else if (protocol == "UDP") return Colors.Red;
+            else if (protocol == "HTTP") return Colors.Green;
+            else if (protocol == "HTTPS") return Colors.Purple;
+            else if (protocol == "DNS") return Colors.Orange;
+            else if (protocol == "ICMP") return Colors.Yellow;
+            else if (protocol == "IP") return Colors.Cyan;
+            else return Colors.White;
         }
 
         protected override void OnClosed(EventArgs e)
         {
             StopCapture();
-            waveOut?.Dispose();
+            if (waveOut != null)
+            {
+                waveOut.Dispose();
+            }
             base.OnClosed(e);
         }
-    }
-
-    public class PacketData
-    {
-        public int Size { get; set; }
-        public DateTime Timestamp { get; set; }
-        public string Protocol { get; set; }
-        public string SourceIP { get; set; }
-        public string DestinationIP { get; set; }
-        public int Port { get; set; }
-    }
-
-    public class PacketVisual
-    {
-        public double X { get; set; }
-        public double Y { get; set; }
-        public double Size { get; set; }
-        public Color Color { get; set; }
-        public double Life { get; set; }
-        public string Protocol { get; set; }
     }
 }
